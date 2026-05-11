@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  commit-msg  —  Local Jira ID enforcement hook
+# -----------------------------------------------------------------------------
+#  PURPOSE
+#  -------
+#  Reject any local `git commit` whose message does not reference a Jira
+#  ticket key (e.g. ABC-1234). This is the FAST FEEDBACK layer that mirrors
+#  the server-side `.github/workflows/commit-policy.yml` gate.
+#
+#  WHY A LOCAL HOOK
+#  ----------------
+#  CI rejection happens minutes after a push. A local hook fails the commit
+#  immediately, so developers never build a stack of bad commits they then
+#  have to rewrite.
+#
+#  HOW IT IS INSTALLED
+#  -------------------
+#  Run once per clone:
+#       bash scripts/install-git-hooks.sh
+#  This points `core.hooksPath` at `scripts/git-hooks/` so the hook is
+#  versioned with the repo and stays in sync across the team.
+#
+#  RECOMMENDED FLOW
+#  ----------------
+#  Use Jira's "Create commit" action from the ticket view — the commit
+#  message is prefixed with the Jira key automatically and this hook is a
+#  no-op. Manual commits must include the key explicitly:
+#       git commit -m "ABC-1234: implement checkout retry"
+# =============================================================================
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="${1:?commit message file path missing}"
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# Canonical Jira key pattern. Keep in sync with commit-policy.yml.
+JIRA_KEY_REGEX='[A-Z][A-Z0-9]+-[0-9]+'
+
+# Allowlist: merge commits, reverts, automated bot commits, release chores.
+ALLOW_PATTERNS='^(Merge |Revert |\[bot\]|chore\(release\):)'
+
+# Strip comment lines that git appends to the message buffer.
+SUBJECT=$(echo "$COMMIT_MSG" | grep -v '^#' | head -n 1)
+
+if [[ "$SUBJECT" =~ $ALLOW_PATTERNS ]]; then
+  exit 0
+fi
+
+if [[ "$SUBJECT" =~ $JIRA_KEY_REGEX ]]; then
+  exit 0
+fi
+
+cat >&2 <<'EOF'
+
+─────────────────────────────────────────────────────────────────
+COMMIT BLOCKED — Jira ticket ID is required
+─────────────────────────────────────────────────────────────────
+Your commit message does not contain a Jira key (e.g. ABC-1234).
+
+PREFERRED FIX
+─────────────
+Open the Jira ticket and use "Create commit" / "Create branch".
+Jira's Git integration will prefix the commit message for you.
+
+MANUAL FIX
+──────────
+Re-run your commit with the ticket key in the subject:
+
+    git commit -m "ABC-1234: short description of the change"
+
+WHY
+───
+The release orchestrator (jira-orchestrator.yml) drives work
+through DEV → STAGING → PRE-PROD → PROD using the Jira ticket
+as the source of truth. Commits without a key cannot be tracked.
+─────────────────────────────────────────────────────────────────
+EOF
+exit 1

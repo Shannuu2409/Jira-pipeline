@@ -1,0 +1,157 @@
+# ============================================================================
+#  commit-policy.yml
+# ----------------------------------------------------------------------------
+#  Enterprise Commit Policy Gate
+#
+#  PURPOSE
+#  -------
+#  Enforce that EVERY commit entering the repository is traceable back to a
+#  Jira ticket. Without a Jira ID in the commit message, the commit (and the
+#  PR that carries it) is BLOCKED at CI. This is the server-side guarantee
+#  that complements the client-side `commit-msg` git hook.
+#
+#  WHY THIS EXISTS
+#  ---------------
+#   * Release traceability: every change can be tied to a Jira ticket, which
+#     is the source of truth for the release state machine driven by
+#     jira-orchestrator.yml (NEW → IN PROGRESS → DEV → STAGING → … → PROD).
+#   * Audit & compliance: SOX / ISO / SOC2 controls require change → ticket
+#     linkage. A blocked CI is the cheapest possible enforcement point.
+#   * Pipeline correctness: jira-orchestrator.yml routes work by Jira issue
+#     key. Commits without a key cannot be orchestrated.
+#
+#  RECOMMENDED DEVELOPER FLOW
+#  --------------------------
+#   1. Developer opens the Jira ticket and clicks
+#         "Create branch"  →  "Create commit"
+#      (Jira's native Git integration prefills the ticket key).
+#   2. The commit message is automatically prefixed, e.g.
+#         "ABC-1234: implement checkout retry"
+#   3. Push → this workflow validates the prefix → PR is allowed to merge.
+#   4. When the developer transitions the Jira ticket to the next state
+#      (e.g. "Ready for Pre-Prod Review"), the Jira webhook fires
+#      `repository_dispatch` and `jira-orchestrator.yml` takes over.
+#
+#  EXPECTED BEHAVIOR
+#  -----------------
+#   * Pass: every commit on the PR has a message matching the Jira regex.
+#   * Fail: ANY commit lacks a Jira key → the job fails and the PR is
+#     blocked from merging (when this check is set as required in branch
+#     protection rules).
+# ============================================================================
+
+name: Commit Policy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+
+concurrency:
+  group: commit-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate-jira-id:
+    name: Validate Jira ID in commit messages
+    runs-on: ubuntu-latest
+
+    env:
+      JIRA_KEY_REGEX: "[A-Z][A-Z0-9]+-[0-9]+"
+      ALLOW_PATTERNS: '^(Merge |Revert |\[bot\]|chore\(release\):)'
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine commit range
+        id: range
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.event.after }}"
+          fi
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "Validating commits in range: $BASE_SHA..$HEAD_SHA"
+
+      - name: Enforce Jira ID prefix
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${BASE_SHA}" || "${BASE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+            COMMITS=$(git log -1 --format="%H" "${HEAD_SHA}")
+          else
+            COMMITS=$(git log --format="%H" "${BASE_SHA}".."${HEAD_SHA}")
+          fi
+
+          FAILED=0
+          while IFS= read -r SHA; do
+            [[ -z "$SHA" ]] && continue
+            SUBJECT=$(git log -1 --format="%s" "$SHA")
+
+            if [[ "$SUBJECT" =~ ${ALLOW_PATTERNS} ]]; then
+              echo "✓ $SHA  (allowed pattern)  $SUBJECT"
+              continue
+            fi
+
+            if [[ "$SUBJECT" =~ ${JIRA_KEY_REGEX} ]]; then
+              echo "✓ $SHA  $SUBJECT"
+            else
+              echo "✗ $SHA  $SUBJECT"
+              FAILED=1
+            fi
+          done <<< "$COMMITS"
+
+          if [[ "$FAILED" -ne 0 ]]; then
+            cat <<'EOF'
+
+          ─────────────────────────────────────────────────────────────────
+          COMMIT POLICY VIOLATION
+          ─────────────────────────────────────────────────────────────────
+          One or more commits do not reference a Jira ticket.
+
+          Every commit subject MUST contain a Jira key, e.g.:
+
+              ABC-1234: short description of the change
+
+          HOW TO FIX
+          ──────────
+          Preferred:
+            Open the Jira ticket → "Create commit" (or "Create branch")
+            and use Jira's native Git integration. The commit message is
+            prefixed with the ticket key automatically.
+
+          Manual:
+            git commit --amend -m "ABC-1234: <your message>"
+            git push --force-with-lease
+
+          For a range of commits:
+            git rebase -i <base>      # reword each commit subject
+
+          WHY THIS IS BLOCKED
+          ───────────────────
+          The release pipeline (jira-orchestrator.yml) routes work by Jira
+          issue key. Without a key, the change cannot be tracked through
+          DEV → STAGING → PRE-PROD → PROD, and audit traceability is lost.
+          ─────────────────────────────────────────────────────────────────
+          EOF
+            exit 1
+          fi
+
+          echo ""
+          echo "All commits reference a Jira ticket. ✓"

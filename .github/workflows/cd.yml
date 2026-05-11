@@ -1,0 +1,29 @@
+name: Simple CD (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ inputs.environment }}
+    steps:
+      - name: Echo environment message
+        run: |
+          case "${{ inputs.environment }}" in
+            dev)
+              echo "this message is from dev" ;;
+            staging)
+              echo "this message is from staging" ;;
+            preprod)
+              echo "this message is from pre-prod" ;;
+            prod)
+              echo "this message is from prod" ;;
+            *)
+              echo "this message is from ${ { inputs.environment } }" ;;
+          esac

@@ -1,0 +1,334 @@
+# ============================================================================
+#  jira-orchestrator.yml
+# ----------------------------------------------------------------------------
+#  Enterprise Release Orchestration Workflow
+#
+#  ROLE OF THIS WORKFLOW
+#  ---------------------
+#  This workflow is NOT a CI pipeline.
+#  This workflow is NOT a Docker build pipeline.
+#  This workflow is NOT a deployment engine.
+#
+#  This workflow is the ORCHESTRATION CONTROLLER that sits between:
+#
+#       Jira (the orchestration brain / source of truth for release state)
+#                                  │
+#                                  ▼
+#       jira-orchestrator.yml      ◄── YOU ARE HERE
+#                                  │
+#                                  ▼
+#       ci.yml  /  cd.yml  /  config-envs.yml   (the execution engines)
+#
+#  Jira decides "what should happen next".
+#  This workflow decides "which downstream pipeline should run, with what
+#  inputs, in which environment, and under which release gates".
+#  GitHub Actions then executes the actual build / deploy via cd.yml.
+#
+#  JIRA WORKFLOW THIS FILE MIRRORS
+#  -------------------------------
+#     NEW → IN PROGRESS → DEV-SERVER → STAGING
+#         → READY FOR PRE-PROD REVIEW → PRE-PROD → PROD
+#
+#  ARCHITECTURE PRINCIPLES ENFORCED HERE
+#  -------------------------------------
+#   * Build Once, Deploy Everywhere (image is built in ci.yml, reused below)
+#   * Runtime Environment Injection (config/*.env files, not rebuilds)
+#   * Immutable Release Snapshots for PRE-PROD and PROD
+#   * Flexible (non-gated) deploys for DEV-SERVER and STAGING
+#   * Release Registry gates promotion into PRE-PROD and PROD
+#   * Concurrency locks prevent overlapping deploys per environment
+#   * Rollback hooks are wired into PROD failure paths
+# ============================================================================
+
+name: Jira Orchestrator
+
+on:
+  repository_dispatch:
+    types:
+      - jira-transition-dev-server
+      - jira-transition-staging
+      - jira-transition-preprod-review
+      - jira-transition-preprod
+      - jira-transition-prod
+
+  workflow_dispatch:
+    inputs:
+      jira_issue_key:
+        description: "Jira issue key (e.g. PROJ-1234)"
+        required: true
+        type: string
+      target_stage:
+        description: "Target Jira stage to orchestrate"
+        required: true
+        type: choice
+        options:
+          - dev-server
+          - staging
+          - preprod-review
+          - preprod
+          - prod
+      service_name:
+        description: "Service / repository being orchestrated"
+        required: true
+        type: string
+      release_candidate:
+        description: "Release candidate ID (required for preprod/prod)"
+        required: false
+        type: string
+      force_promotion:
+        description: "Bypass release-readiness gating (break-glass only)"
+        required: false
+        default: false
+        type: boolean
+
+  workflow_call:
+    inputs:
+      jira_issue_key: { required: true, type: string }
+      target_stage: { required: true, type: string }
+      service_name: { required: true, type: string }
+      release_candidate: { required: false, type: string }
+      force_promotion: { required: false, type: boolean, default: false }
+
+concurrency:
+  group: jira-orchestrator-${{ github.event.client_payload.jira_issue_key || inputs.jira_issue_key }}-${{ github.event.client_payload.target_stage || inputs.target_stage }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  deployments: write
+  id-token: write
+
+env:
+  JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+  RELEASE_REGISTRY_URL: ${{ vars.RELEASE_REGISTRY_URL }}
+  DEPLOY_STATE_API: ${{ vars.DEPLOY_STATE_API }}
+
+jobs:
+  parse-jira-event:
+    name: "Stage 0 · Parse Jira Event"
+    runs-on: ubuntu-latest
+    outputs:
+      jira_issue_key: ${{ steps.normalize.outputs.jira_issue_key }}
+      target_stage: ${{ steps.normalize.outputs.target_stage }}
+      service_name: ${{ steps.normalize.outputs.service_name }}
+      release_candidate: ${{ steps.normalize.outputs.release_candidate }}
+      force_promotion: ${{ steps.normalize.outputs.force_promotion }}
+      target_env: ${{ steps.normalize.outputs.target_env }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Normalize trigger payload
+        id: normalize
+        run: bash scripts/jira/parse-event.sh
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          DISPATCH_INPUTS: ${{ toJson(inputs) }}
+
+      - name: Echo resolved orchestration context
+        run: |
+          echo "Issue:             ${{ steps.normalize.outputs.jira_issue_key }}"
+          echo "Stage:             ${{ steps.normalize.outputs.target_stage }}"
+          echo "Service:           ${{ steps.normalize.outputs.service_name }}"
+          echo "Target Env:        ${{ steps.normalize.outputs.target_env }}"
+          echo "Release Candidate: ${{ steps.normalize.outputs.release_candidate }}"
+          echo "Force Promotion:   ${{ steps.normalize.outputs.force_promotion }}"
+
+  deploy-dev-server:
+    name: "Stage 3 · Deploy to DEV-SERVER"
+    needs: parse-jira-event
+    if: needs.parse-jira-event.outputs.target_stage == 'dev-server'
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: dev
+      service: ${{ needs.parse-jira-event.outputs.service_name }}
+      jira_issue: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+      release_mode: ephemeral
+      grouped_deploy: false
+    secrets: inherit
+
+  open-staging-pr:
+    name: "Stage 4a · Open Staging PR"
+    needs: parse-jira-event
+    if: needs.parse-jira-event.outputs.target_stage == 'staging'
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create / update PR into staging
+        id: create-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_KEY: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+          SERVICE: ${{ needs.parse-jira-event.outputs.service_name }}
+        run: bash scripts/jira/open-staging-pr.sh
+
+  deploy-staging:
+    name: "Stage 4b · Deploy to STAGING"
+    needs: [parse-jira-event, open-staging-pr]
+    if: needs.parse-jira-event.outputs.target_stage == 'staging'
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: staging
+      service: ${{ needs.parse-jira-event.outputs.service_name }}
+      jira_issue: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+      release_mode: independent
+      grouped_deploy: false
+    secrets: inherit
+
+  release-readiness-gate:
+    name: "Stage 5 · Release Readiness Gate"
+    needs: parse-jira-event
+    if: needs.parse-jira-event.outputs.target_stage == 'preprod-review'
+    runs-on: ubuntu-latest
+    outputs:
+      release_candidate_id: ${{ steps.mint-rc.outputs.release_candidate_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate coupled repositories
+        run: bash scripts/jira/validate-coupled-services.sh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          ISSUE_KEY: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+
+      - name: Mint Release Candidate
+        id: mint-rc
+        run: bash scripts/jira/mint-release-candidate.sh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.RELEASE_REGISTRY_TOKEN }}
+          ISSUE_KEY: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+
+      - name: Write back RC to Jira
+        run: bash scripts/jira/comment-rc-on-issue.sh
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          ISSUE_KEY: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+          RC_ID: ${{ steps.mint-rc.outputs.release_candidate_id }}
+
+  validate-rc-for-preprod:
+    name: "Stage 6a · Validate RC"
+    needs: parse-jira-event
+    if: needs.parse-jira-event.outputs.target_stage == 'preprod'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify RC exists and is grouped-deploy ready
+        run: bash scripts/jira/verify-release-candidate.sh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.RELEASE_REGISTRY_TOKEN }}
+          RC_ID: ${{ needs.parse-jira-event.outputs.release_candidate }}
+          FORCE: ${{ needs.parse-jira-event.outputs.force_promotion }}
+
+  deploy-preprod:
+    name: "Stage 6b · Deploy to PRE-PROD"
+    needs: [parse-jira-event, validate-rc-for-preprod]
+    if: needs.parse-jira-event.outputs.target_stage == 'preprod'
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: preprod
+      service: all-coupled
+      jira_issue: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+      release_mode: immutable
+      grouped_deploy: true
+      release_candidate_id: ${{ needs.parse-jira-event.outputs.release_candidate }}
+    secrets: inherit
+
+  preprod-validation-suite:
+    name: "Stage 6c · Pre-Prod Validation Suite"
+    needs: deploy-preprod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke tests
+        run: bash scripts/cd/run-smoke-tests.sh preprod
+      - name: Playwright E2E
+        run: bash scripts/cd/run-playwright.sh preprod
+      - name: OWASP ZAP baseline scan
+        run: bash scripts/cd/run-zap-scan.sh preprod
+      - name: Mark RC as Pre-Prod Verified
+        run: bash scripts/jira/mark-rc-verified.sh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.RELEASE_REGISTRY_TOKEN }}
+          RC_ID: ${{ needs.parse-jira-event.outputs.release_candidate }}
+
+  deploy-prod:
+    name: "Stage 7 · Deploy to PROD"
+    needs: parse-jira-event
+    if: needs.parse-jira-event.outputs.target_stage == 'prod'
+    concurrency:
+      group: prod-deploy
+      cancel-in-progress: false
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: prod
+      service: all-coupled
+      jira_issue: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+      release_mode: immutable
+      grouped_deploy: true
+      release_candidate_id: ${{ needs.parse-jira-event.outputs.release_candidate }}
+      strategy: blue-green
+    secrets: inherit
+
+  prod-postdeploy:
+    name: "Stage 7b · Post-Deploy Verification"
+    needs: [parse-jira-event, deploy-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Health checks
+        run: bash scripts/cd/run-health-checks.sh prod
+      - name: Synthetic monitoring probe
+        run: bash scripts/cd/run-synthetics.sh prod
+      - name: Update Deployment State Registry
+        run: bash scripts/cd/update-deploy-state.sh prod success
+        env:
+          DEPLOY_STATE_TOKEN: ${{ secrets.DEPLOY_STATE_TOKEN }}
+          RC_ID: ${{ needs.parse-jira-event.outputs.release_candidate }}
+      - name: Transition Jira to "Released"
+        run: bash scripts/jira/transition-issue.sh Released
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          ISSUE_KEY: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+
+  prod-rollback:
+    name: "Stage 7c · Rollback (on failure)"
+    needs: [parse-jira-event, deploy-prod, prod-postdeploy]
+    if: failure() && needs.parse-jira-event.outputs.target_stage == 'prod'
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: prod
+      service: all-coupled
+      jira_issue: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+      release_mode: rollback
+      grouped_deploy: true
+    secrets: inherit
+
+  finalize:
+    name: "Finalize · Report orchestration outcome"
+    needs:
+      - parse-jira-event
+      - deploy-dev-server
+      - deploy-staging
+      - release-readiness-gate
+      - deploy-preprod
+      - preprod-validation-suite
+      - deploy-prod
+      - prod-postdeploy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Post orchestration summary to Jira
+        run: bash scripts/jira/post-orchestration-summary.sh
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          ISSUE_KEY: ${{ needs.parse-jira-event.outputs.jira_issue_key }}
+          STAGE: ${{ needs.parse-jira-event.outputs.target_stage }}
+          STATUS: ${{ job.status }}

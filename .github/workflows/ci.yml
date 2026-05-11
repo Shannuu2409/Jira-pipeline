@@ -1,0 +1,30 @@
+name: Simple CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+
+jobs:
+  echo-messages:
+    name: Echo messages for environments
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, staging, preprod, prod]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Echo environment message
+        run: |
+          if [ "${{ matrix.env }}" = "dev" ]; then
+            echo "this message is from dev"
+          elif [ "${{ matrix.env }}" = "staging" ]; then
+            echo "this message is from staging"
+          elif [ "${{ matrix.env }}" = "preprod" ]; then
+            echo "this message is from pre-prod"
+          else
+            echo "this message is from prod"
+          fi
