@@ -67,6 +67,10 @@ MANUAL FIX
 ──────────
 Re-run your commit with the ticket key in the subject:
 
+    git commit --amend -m "ABC-1234: short description of the change" 
+                          
+                          OR
+
     git commit -m "ABC-1234: short description of the change"
 
 WHY
